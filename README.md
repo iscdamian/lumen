@@ -150,15 +150,37 @@ Common options:
 | `--encoder <backend>`  | `auto`, `software` or `hardware`                      |
 | `--max-bitrate <rate>` | Bitrate ceiling such as `8000k` or `2M`               |
 | `--name <name>`        | Name shown to viewers and on the dashboard            |
+| `--interface <name>`   | Select the LAN interface by OS name (e.g. `en1`) and bind to its current IPv4 address |
 | `--bind <ip>`          | Select the LAN interface explicitly                   |
 | `--port <port>`        | Viewer/signaling port, default `3131`                 |
 | `--auto-accept`        | Replace manual approval with a six-digit pairing code |
+| `--auth-mode <mode>`   | `approve` (default), `pairing`, or `none` (open access — see below) |
 | `--no-audio`           | Disable system audio                                  |
 | `--no-qr`              | Do not print the terminal QR code                     |
 | `--allow-lan-admin`    | Make the host dashboard reachable from the LAN        |
 | `--verbose`            | Enable debug logging and pipeline statistics          |
 
 Run `lumen serve --help` for the complete CLI reference.
+
+#### Interface selection
+
+`--interface <name>` resolves an OS network interface by name (for example
+`en1`) and binds to its current IPv4 address, so DHCP address changes are
+tolerated and no interface-selection menu is shown. It does not fall back to
+a different interface if the named one has no usable address.
+
+#### Open-access mode (unauthenticated LAN)
+
+`--auth-mode none` admits **every** viewer automatically — no host approval,
+QR code, pairing code, device enrollment, credential, or cookie. It requires
+`--interface` or `--bind` and binds the HTTP/WebRTC listener to that single
+LAN interface only (never all interfaces).
+
+> ⚠️ This grants screen access to anyone who can reach the service on that
+> interface. It is explicit and opt-in; the default remains manual approval.
+> Do not expose it to the WAN or a public reverse proxy. For a turnkey,
+> unattended macOS deployment (LaunchAgent + 30-minute restart supervisor +
+> install scripts) see [`deploy/macos/`](deploy/macos/README.md).
 
 ### Viewer controls
 

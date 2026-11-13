@@ -1,0 +1,4 @@
+# Shell scripts and launchd config for the macOS deployment must stay LF,
+# otherwise bash on macOS fails with "bad interpreter: ... ^M".
+*.sh text eol=lf
+deploy/macos/config.env text eol=lf

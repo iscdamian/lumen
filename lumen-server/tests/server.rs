@@ -84,10 +84,25 @@ async fn start_with_pairing(approve: bool, pairing: Option<PairingCode>) -> Test
   start_with(approve, pairing, None).await
 }
 
+/// Open-access server: no auto-responder and no pairing — every join is
+/// admitted by the server itself, mirroring `--auth-mode none`.
+async fn start_open_access() -> TestServer {
+  start_inner(false, None, None, true).await
+}
+
 async fn start_with(
   approve: bool,
   pairing: Option<PairingCode>,
   session_name: Option<&str>,
+) -> TestServer {
+  start_inner(approve, pairing, session_name, false).await
+}
+
+async fn start_inner(
+  approve: bool,
+  pairing: Option<PairingCode>,
+  session_name: Option<&str>,
+  open_access: bool,
 ) -> TestServer {
   let admin_token = SessionToken::generate().expect("admin token");
   let (authorizer, approvals) = Authorizer::channel(16);
@@ -100,9 +115,11 @@ async fn start_with(
   let shutdown = CancellationToken::new();
   let server = spawn_server(ServerConfig {
     port: 0,
+    http_bind: std::net::Ipv4Addr::LOCALHOST.into(),
     admin_token: admin_token.clone(),
     admin_allow_lan: false,
     auto_accept_pairing: pairing,
+    open_access,
     authorizer,
     approvals: approvals.clone(),
     registry: Arc::clone(&registry),
@@ -435,6 +452,53 @@ async fn auto_accept_requires_and_throttles_pairing_codes() {
     ws_connect(srv.addr, &format!("/ws/{grant}")).await.is_ok(),
     "the correct pairing code admits an unattended viewer"
   );
+  srv.stop().await;
+}
+
+#[tokio::test]
+async fn open_access_admits_every_viewer_without_approval_or_pairing() {
+  // No auto-responder and no pairing code: the server itself approves.
+  let mut srv = start_open_access().await;
+  let (status, body) = http_request(srv.addr, "GET", "/api/join/config").await;
+  assert_eq!(status, 200);
+  assert!(body.contains(r#""openAccess":true"#));
+  assert!(
+    body.contains(r#""pairingRequired":false"#),
+    "open access must never demand a pairing code"
+  );
+
+  // A plain join (no pairing body) is admitted with no host interaction.
+  let join = join(&srv).await;
+  let grant = wait_approved(&srv, &join).await;
+  assert!(
+    ws_connect(srv.addr, &format!("/ws/{grant}")).await.is_ok(),
+    "open access admits an anonymous viewer straight to signaling"
+  );
+  assert!(
+    srv.approvals.poll().is_empty(),
+    "open access leaves nothing waiting in the host approval queue"
+  );
+  srv.stop().await;
+}
+
+#[tokio::test]
+async fn open_access_admits_multiple_simultaneous_viewers() {
+  let mut srv = start_open_access().await;
+  let first = join(&srv).await;
+  let grant_a = wait_approved(&srv, &first).await;
+  let mut stream_a = ws_connect(srv.addr, &format!("/ws/{grant_a}"))
+    .await
+    .expect("viewer A connects");
+  // Same source address: clear the per-IP join interval before re-joining.
+  tokio::time::sleep(Duration::from_millis(1_050)).await;
+  let second = join(&srv).await;
+  let grant_b = wait_approved(&srv, &second).await;
+  let mut stream_b = ws_connect(srv.addr, &format!("/ws/{grant_b}"))
+    .await
+    .expect("viewer B connects");
+  // Both sockets negotiate independently.
+  let _a = next_json_type(&mut stream_a, "offer").await;
+  let _b = next_json_type(&mut stream_b, "offer").await;
   srv.stop().await;
 }
 

@@ -45,6 +45,17 @@ pub enum NetworkError {
   /// No usable interface was found.
   #[error("no usable LAN interface found; pass --bind <ip> explicitly")]
   NoneFound,
+  /// The named interface (`--interface`) has no usable IPv4/IPv6 address.
+  #[error(
+    "network interface {name:?} has no usable address assigned \
+     (is it up and connected?)"
+  )]
+  InterfaceUnavailable {
+    /// The requested OS interface name (e.g. `en1`).
+    name: String,
+    /// Suitable interfaces that *were* found, for guidance.
+    available: Vec<LanInterface>,
+  },
 }
 
 /// Returns `true` when an address is plausible for LAN sharing.
@@ -131,7 +142,57 @@ pub fn select(
   Ok(suitable)
 }
 
-/// Probe whether this host can actually send IPv4 multicast.
+/// Resolve a specific OS interface by name (e.g. `en1`) to a single
+/// bind address, without any interactive prompt.
+///
+/// Among the suitable addresses assigned to `name`:
+///
+/// * `preferred = Some(ip)` wins when it is still assigned to the
+///   interface (survives the DHCP lease that handed out `.127`);
+/// * otherwise the first IPv4 address is chosen (IPv4 sorts first), so a
+///   dual-stack interface deterministically advertises its IPv4;
+/// * if only IPv6 addresses exist, the first of those is used.
+///
+/// # Errors
+///
+/// Returns [`NetworkError::InterfaceUnavailable`] when `name` currently
+/// has no suitable address — e.g. the link is down or DHCP has not yet
+/// assigned one. The caller may retry (addresses appear as the network
+/// comes up) rather than falling back to an unintended interface.
+pub fn select_named(
+  interfaces: &[LanInterface],
+  name: &str,
+  preferred: Option<IpAddr>,
+) -> Result<LanInterface, NetworkError> {
+  let mut matching: Vec<LanInterface> = interfaces
+    .iter()
+    .filter(|i| i.name == name && is_suitable(i.ip))
+    .cloned()
+    .collect();
+  // IPv4 first, then by address: deterministic pick on dual-stack links.
+  matching.sort_by(|a, b| match (a.ip, b.ip) {
+    (IpAddr::V4(x), IpAddr::V4(y)) => x.cmp(&y),
+    (IpAddr::V4(_), IpAddr::V6(_)) => std::cmp::Ordering::Less,
+    (IpAddr::V6(_), IpAddr::V4(_)) => std::cmp::Ordering::Greater,
+    (IpAddr::V6(x), IpAddr::V6(y)) => x.cmp(&y),
+  });
+  if let Some(ip) = preferred
+    && let Some(iface) = matching.iter().find(|i| i.ip == ip)
+  {
+    return Ok(iface.clone());
+  }
+  matching
+    .into_iter()
+    .next()
+    .ok_or_else(|| NetworkError::InterfaceUnavailable {
+      name: name.to_owned(),
+      available: interfaces
+        .iter()
+        .filter(|i| is_suitable(i.ip))
+        .cloned()
+        .collect(),
+    })
+}
 ///
 /// Chromium browsers obfuscate their ICE host candidates as mDNS
 /// `.local` names, which `lumen` resolves by querying `224.0.0.251:5353`
@@ -233,6 +294,55 @@ mod tests {
 
     let err = select(&ifaces, Some("10.0.0.9".parse().unwrap())).unwrap_err();
     assert!(matches!(err, NetworkError::Unavailable { available, .. } if available.len() == 1));
+  }
+
+  #[test]
+  fn named_interface_resolves_to_its_address() {
+    let ifaces = vec![
+      iface("en0", "192.168.1.42"),
+      iface("en1", "192.168.188.127"),
+    ];
+    let chosen = select_named(&ifaces, "en1", None).unwrap();
+    assert_eq!(chosen.name, "en1");
+    assert_eq!(chosen.ip.to_string(), "192.168.188.127");
+  }
+
+  #[test]
+  fn named_interface_prefers_the_expected_address_when_present() {
+    let ifaces = vec![
+      iface("en1", "192.168.188.50"),
+      iface("en1", "192.168.188.127"),
+    ];
+    let preferred = Some("192.168.188.127".parse().unwrap());
+    let chosen = select_named(&ifaces, "en1", preferred).unwrap();
+    assert_eq!(chosen.ip.to_string(), "192.168.188.127");
+  }
+
+  #[test]
+  fn named_interface_falls_back_to_current_address_after_dhcp_change() {
+    // The preferred `.127` lease is gone; DHCP now hands out `.200`.
+    let ifaces = vec![iface("en1", "192.168.188.200")];
+    let preferred = Some("192.168.188.127".parse().unwrap());
+    let chosen = select_named(&ifaces, "en1", preferred).unwrap();
+    assert_eq!(chosen.ip.to_string(), "192.168.188.200");
+  }
+
+  #[test]
+  fn named_interface_prefers_ipv4_on_dual_stack() {
+    let ifaces = vec![iface("en1", "fd00::5"), iface("en1", "192.168.188.127")];
+    let chosen = select_named(&ifaces, "en1", None).unwrap();
+    assert_eq!(chosen.ip.to_string(), "192.168.188.127");
+  }
+
+  #[test]
+  fn named_interface_without_address_errors_instead_of_falling_back() {
+    // `en1` is down (only link-local); `en0` must never be chosen in its place.
+    let ifaces = vec![iface("en0", "192.168.1.42"), iface("en1", "169.254.9.9")];
+    let err = select_named(&ifaces, "en1", None).unwrap_err();
+    assert!(
+      matches!(err, NetworkError::InterfaceUnavailable { ref name, .. } if name == "en1"),
+      "a missing named interface must not silently bind another"
+    );
   }
 
   #[test]

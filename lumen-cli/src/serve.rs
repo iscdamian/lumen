@@ -18,12 +18,23 @@ use tokio_util::sync::CancellationToken;
 use crate::ServeArgs;
 use crate::pick_interface;
 use crate::stream_config;
+use crate::{open_access, pairing_enabled, validate_auth};
 use lumen_core::{Dimensions, PipelineStats};
 use lumen_server::{ApprovalQueue, AuthDecision, PeerRegistry, describe_user_agent};
 use lumen_session::Session;
-use lumen_session::network::LanInterface;
+use lumen_session::network::{self, LanInterface};
 use lumen_session::session::{DEFAULT_PORT, SessionConfig, SessionInfo};
 use lumen_session::start_session;
+
+/// The `.127` address the deployment expects `en1` to hold; preferred when
+/// it is still assigned, but never required (DHCP may reassign it).
+const EXPECTED_EN1_ADDRESS: std::net::IpAddr =
+  std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 188, 127));
+
+/// How long to keep retrying a named interface that has no address yet
+/// (DHCP still negotiating, link coming up at login). Prevents a crash
+/// loop at boot while still failing eventually if the NIC never appears.
+const INTERFACE_WAIT: Duration = Duration::from_secs(30);
 
 /// Run `lumen serve` to completion (returns after Ctrl+C).
 ///
@@ -52,19 +63,35 @@ pub fn run(args: ServeArgs) -> anyhow::Result<()> {
   runtime.block_on(serve(args))
 }
 
+/// Resolve a named interface (e.g. `en1`) to its current address without
+/// any prompt, retrying briefly while the link/DHCP comes up at login.
+fn resolve_named_interface(name: &str) -> anyhow::Result<LanInterface> {
+  let deadline = std::time::Instant::now() + INTERFACE_WAIT;
+  loop {
+    let interfaces = network::discover()?;
+    match network::select_named(&interfaces, name, Some(EXPECTED_EN1_ADDRESS)) {
+      Ok(iface) => return Ok(iface),
+      Err(e) if std::time::Instant::now() < deadline => {
+        tracing::warn!("{e}; waiting for the interface to come up...");
+        std::thread::sleep(Duration::from_secs(2));
+      }
+      Err(e) => return Err(e.into()),
+    }
+  }
+}
+
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+  validate_auth(&args)?;
   let cfg = stream_config(&args)?;
-  // The interface choice may need an interactive prompt, so it stays here;
-  // the session receives the resolved address.
-  let iface = match args.bind {
-    Some(ip) => LanInterface {
+  // Interface resolution stays in the frontend: an explicit --bind wins,
+  // then a named --interface (no prompt), then the interactive picker.
+  let iface = match (&args.bind, &args.interface) {
+    (Some(ip), _) => LanInterface {
       name: "manual".into(),
-      ip,
+      ip: *ip,
     },
-    None => pick_interface(&lumen_session::network::select(
-      &lumen_session::network::discover()?,
-      None,
-    )?)?,
+    (None, Some(name)) => resolve_named_interface(name)?,
+    (None, None) => pick_interface(&network::select(&network::discover()?, None)?)?,
   };
 
   let session = start_session(SessionConfig {
@@ -73,7 +100,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     window: args.window,
     bind: Some(iface.ip),
     port: args.port.unwrap_or(DEFAULT_PORT),
-    auto_accept: args.auto_accept,
+    auto_accept: pairing_enabled(&args),
+    open_access: open_access(&args),
     allow_lan_admin: args.allow_lan_admin,
     mdns: true,
     webrtc_bind: Vec::new(),
@@ -94,7 +122,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 
   // The terminal prompt is one approval surface; the host dashboard is
   // another. Without an interactive stdin the dashboard carries approvals.
-  if !args.auto_accept && std::io::stdin().is_terminal() {
+  // Pairing and open-access modes approve automatically, so neither
+  // surface runs.
+  if !pairing_enabled(&args) && !open_access(&args) && std::io::stdin().is_terminal() {
     spawn_approval_loop(session.approvals(), session.shutdown_token());
   }
 
@@ -133,6 +163,18 @@ fn print_banner(args: &ServeArgs, info: &SessionInfo) {
   println!("Audio:        {}", info.stream.audio_label);
   println!("Encoder:      {}", info.stream.encoder_label);
   println!("Listening on: {}:{}", info.iface.ip, info.port);
+  if open_access(args) {
+    println!();
+    println!(
+      "⚠  OPEN ACCESS (--auth-mode none): every viewer that can reach \
+       {}:{} is admitted",
+      info.iface.ip, info.port
+    );
+    println!(
+      "   with no approval, pairing code, or credential. Use only on a \
+       trusted LAN; never expose this port to the internet."
+    );
+  }
   println!();
   println!("Open on any device:");
   println!();

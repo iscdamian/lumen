@@ -131,14 +131,25 @@ pub struct StreamInfo {
 
 /// Runtime wiring the server needs from the orchestrator.
 pub struct ServerConfig {
-  /// TCP port to bind (all interfaces).
+  /// TCP port to bind.
   pub port: u16,
+  /// Local address to bind the HTTP/signaling listener to. `UNSPECIFIED`
+  /// (`0.0.0.0`) listens on every interface (upstream default); a concrete
+  /// LAN address restricts the service to that one interface — used by the
+  /// hardened open-access mode so anonymous access can never leak onto an
+  /// unintended network.
+  pub http_bind: IpAddr,
   /// Secret admin token: grants the dashboard and `/api/admin/*`.
   pub admin_token: SessionToken,
   /// Allow non-localhost clients on the admin surface (default off).
   pub admin_allow_lan: bool,
   /// Pairing secret required for unattended joins; absent in normal mode.
   pub auto_accept_pairing: Option<PairingCode>,
+  /// Open-access mode: admit every viewer automatically with no host
+  /// approval, pairing code, or any other credential. This deliberately
+  /// grants screen access to anyone who can reach the bound interface, so
+  /// it is opt-in only and must be paired with a concrete `http_bind`.
+  pub open_access: bool,
   /// Host approval channel for new viewers.
   pub authorizer: Authorizer,
   /// Shared approval pool polled by the admin dashboard.
@@ -188,7 +199,7 @@ impl ServerHandle {
 ///
 /// See [`ServerError`].
 pub async fn spawn_server(cfg: ServerConfig) -> Result<ServerHandle, ServerError> {
-  let listener = TcpListener::bind(("0.0.0.0", cfg.port))
+  let listener = TcpListener::bind((cfg.http_bind, cfg.port))
     .await
     .map_err(|source| ServerError::Bind {
       port: cfg.port,
@@ -205,6 +216,7 @@ pub async fn spawn_server(cfg: ServerConfig) -> Result<ServerHandle, ServerError
     admin_token: cfg.admin_token,
     admin_allow_lan: cfg.admin_allow_lan,
     auto_accept_pairing: cfg.auto_accept_pairing,
+    open_access: cfg.open_access,
     approvals: cfg.approvals,
     joins,
     grants,
@@ -236,6 +248,7 @@ struct AppState {
   admin_token: SessionToken,
   admin_allow_lan: bool,
   auto_accept_pairing: Option<PairingCode>,
+  open_access: bool,
   approvals: ApprovalQueue,
   joins: JoinManager,
   grants: GrantStore,
@@ -328,6 +341,7 @@ const INVALID_LINK_HTML: &str = r#"<!doctype html>
 async fn join_config(State(state): State<Arc<AppState>>) -> Response {
   axum::Json(serde_json::json!({
     "pairingRequired": state.auto_accept_pairing.is_some(),
+    "openAccess": state.open_access,
     "sessionName": state.stream.session_name,
   }))
   .into_response()
@@ -383,7 +397,9 @@ async fn join_create(
   };
   match state.joins.create(info) {
     Ok(join) => {
-      if state.auto_accept_pairing.is_some() {
+      // Pairing mode and open-access mode both resolve the host approval
+      // immediately; open access additionally requires no credential at all.
+      if state.auto_accept_pairing.is_some() || state.open_access {
         let _ = state.approvals.decide(join.id, AuthDecision::Allow);
       }
       (

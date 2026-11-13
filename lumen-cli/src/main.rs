@@ -5,10 +5,26 @@ mod serve;
 use std::io::IsTerminal;
 use std::net::IpAddr;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use lumen_core::{EncoderPreference, Quality, StreamConfig, normalize_session_name};
 use lumen_media::capture::{list_displays, list_windows};
 use lumen_session::network::LanInterface;
+
+/// How incoming viewers are authorized.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+enum AuthMode {
+  /// Every viewer must be approved by the host (terminal prompt or the
+  /// admin dashboard). The secure default.
+  #[default]
+  Approve,
+  /// Replace manual approval with a six-digit pairing code (equivalent to
+  /// `--auto-accept`).
+  Pairing,
+  /// Open access: admit every viewer automatically with no approval,
+  /// pairing code, or credential of any kind. Deliberately unsafe — the
+  /// listener is bound to the single selected LAN interface only. Opt-in.
+  None,
+}
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +70,12 @@ struct ServeArgs {
   #[arg(long, value_name = "ip")]
   bind: Option<IpAddr>,
 
+  /// Select the LAN interface by OS name (e.g. `en1`) and bind to its
+  /// current address, with no interactive prompt. Overrides `--bind`'s
+  /// prompt-avoidance but is itself overridden by an explicit `--bind`.
+  #[arg(long, value_name = "name")]
+  interface: Option<String>,
+
   /// TCP port for the viewer/signaling server (default: 3131)
   #[arg(long, value_name = "port")]
   port: Option<u16>,
@@ -83,6 +105,13 @@ struct ServeArgs {
   #[arg(long)]
   auto_accept: bool,
 
+  /// Viewer authorization mode: approve | pairing | none (default:
+  /// approve). `none` is open access — no approval, pairing, or any
+  /// credential — and requires `--interface` or `--bind` so the server
+  /// binds to a single LAN interface, never all of them.
+  #[arg(long, value_name = "mode", value_enum, default_value_t = AuthMode::Approve)]
+  auth_mode: AuthMode,
+
   /// Allow non-localhost clients to reach the /admin host dashboard
   #[arg(long)]
   allow_lan_admin: bool,
@@ -106,6 +135,7 @@ fn main() -> anyhow::Result<()> {
     display: None,
     window: None,
     bind: None,
+    interface: None,
     port: None,
     fps: None,
     encoder: None,
@@ -113,6 +143,7 @@ fn main() -> anyhow::Result<()> {
     max_bitrate: None,
     name: None,
     auto_accept: false,
+    auth_mode: AuthMode::Approve,
     allow_lan_admin: false,
     no_audio: false,
     no_qr: false,
@@ -175,6 +206,33 @@ fn stream_config(args: &ServeArgs) -> anyhow::Result<StreamConfig> {
   Ok(cfg)
 }
 
+/// Whether viewers are admitted with no credential of any kind.
+fn open_access(args: &ServeArgs) -> bool {
+  args.auth_mode == AuthMode::None
+}
+
+/// Whether a six-digit pairing code gates unattended joins. `--auto-accept`
+/// stays a synonym for `--auth-mode pairing`; open access never pairs.
+fn pairing_enabled(args: &ServeArgs) -> bool {
+  !open_access(args) && (args.auth_mode == AuthMode::Pairing || args.auto_accept)
+}
+
+/// Reject footgun combinations before a session starts.
+///
+/// Open access deliberately grants screen access to anyone who can reach
+/// the service, so it must bind to exactly one interface — never the
+/// wildcard. We require `--interface` or `--bind` to make that explicit.
+fn validate_auth(args: &ServeArgs) -> anyhow::Result<()> {
+  if open_access(args) && args.interface.is_none() && args.bind.is_none() {
+    anyhow::bail!(
+      "--auth-mode none (open access) grants unauthenticated screen access \
+       and must be pinned to one interface: pass --interface <name> \
+       (e.g. en1) or --bind <ip>"
+    );
+  }
+  Ok(())
+}
+
 /// Ask the user to pick between several plausible LAN interfaces.
 fn pick_interface(interfaces: &[LanInterface]) -> anyhow::Result<LanInterface> {
   if interfaces.len() == 1 {
@@ -212,6 +270,7 @@ mod tests {
       display: None,
       window: None,
       bind: None,
+      interface: None,
       port: None,
       name: name.map(str::to_owned),
       fps: None,
@@ -219,6 +278,7 @@ mod tests {
       quality: None,
       max_bitrate: None,
       auto_accept: false,
+      auth_mode: AuthMode::Approve,
       allow_lan_admin: false,
       no_audio: false,
       no_qr: false,
@@ -249,6 +309,82 @@ mod tests {
       panic!("expected a serve command");
     };
     assert_eq!(args.name, None);
+  }
+
+  #[test]
+  fn cli_accepts_the_interface_flag() {
+    let cli = Cli::try_parse_from(["lumen", "serve", "--interface", "en1"])
+      .expect("--interface must parse");
+    let Some(Command::Serve(args)) = cli.command else {
+      panic!("expected a serve command");
+    };
+    assert_eq!(args.interface.as_deref(), Some("en1"));
+  }
+
+  #[test]
+  fn auth_mode_defaults_to_approve() {
+    let cli = Cli::try_parse_from(["lumen", "serve"]).expect("serve must parse");
+    let Some(Command::Serve(args)) = cli.command else {
+      panic!("expected a serve command");
+    };
+    assert_eq!(args.auth_mode, AuthMode::Approve);
+    assert!(!open_access(&args), "approve mode is not open access");
+    assert!(!pairing_enabled(&args), "approve mode has no pairing code");
+  }
+
+  #[test]
+  fn auth_mode_none_is_open_access() {
+    let cli = Cli::try_parse_from([
+      "lumen",
+      "serve",
+      "--auth-mode",
+      "none",
+      "--interface",
+      "en1",
+    ])
+    .expect("--auth-mode none must parse");
+    let Some(Command::Serve(args)) = cli.command else {
+      panic!("expected a serve command");
+    };
+    assert_eq!(args.auth_mode, AuthMode::None);
+    assert!(open_access(&args));
+    assert!(
+      !pairing_enabled(&args),
+      "open access never mints a pairing code"
+    );
+  }
+
+  #[test]
+  fn auth_mode_pairing_matches_auto_accept() {
+    let paired = Cli::try_parse_from(["lumen", "serve", "--auth-mode", "pairing"])
+      .expect("--auth-mode pairing must parse");
+    let Some(Command::Serve(paired)) = paired.command else {
+      panic!("expected a serve command");
+    };
+    assert!(pairing_enabled(&paired));
+    assert!(!open_access(&paired));
+
+    let legacy =
+      Cli::try_parse_from(["lumen", "serve", "--auto-accept"]).expect("--auto-accept must parse");
+    let Some(Command::Serve(legacy)) = legacy.command else {
+      panic!("expected a serve command");
+    };
+    assert!(
+      pairing_enabled(&legacy),
+      "--auto-accept stays equivalent to pairing mode"
+    );
+  }
+
+  #[test]
+  fn open_access_requires_an_interface_or_bind() {
+    let mut args = serve_args_with(None);
+    args.auth_mode = AuthMode::None;
+    assert!(
+      validate_auth(&args).is_err(),
+      "open access without --interface/--bind must be rejected"
+    );
+    args.interface = Some("en1".to_owned());
+    assert!(validate_auth(&args).is_ok());
   }
 
   #[test]

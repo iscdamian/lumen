@@ -37,6 +37,9 @@ pub const DEFAULT_PORT: u16 = 3131;
 /// The struct is deliberately plain data: argument parsing, prompts and
 /// platform defaults stay in the frontends, the session only executes.
 #[derive(Clone, Debug)]
+// Four independent on/off capture/admission toggles; grouping them into a
+// sub-struct would not clarify call sites that set them individually.
+#[allow(clippy::struct_excessive_bools)]
 pub struct SessionConfig {
   /// Resolved stream configuration (fps, quality, audio, encoder, name).
   pub stream: StreamConfig,
@@ -51,6 +54,11 @@ pub struct SessionConfig {
   pub port: u16,
   /// Admit viewers without host approval via a pairing code.
   pub auto_accept: bool,
+  /// Open-access mode: admit every viewer automatically with no approval,
+  /// pairing code, or credential of any kind. Deliberately unsafe and
+  /// opt-in; the HTTP listener is bound to the single resolved interface
+  /// (never all interfaces) so anonymous access cannot leak off `bind`.
+  pub open_access: bool,
   /// Allow non-localhost clients on the admin dashboard.
   pub allow_lan_admin: bool,
   /// Advertise the stable `lumen.local` hostname via mDNS.
@@ -68,6 +76,7 @@ impl Default for SessionConfig {
       bind: None,
       port: DEFAULT_PORT,
       auto_accept: false,
+      open_access: false,
       allow_lan_admin: false,
       mdns: true,
       webrtc_bind: Vec::new(),
@@ -216,6 +225,7 @@ impl Session {
 ///
 /// See [`SessionError`]. mDNS advertisement failure is never fatal: the
 /// session degrades to the IP URL.
+#[allow(clippy::too_many_lines)]
 pub async fn start_session(cfg: SessionConfig) -> Result<Session, SessionError> {
   cfg.stream.validate()?;
 
@@ -239,7 +249,11 @@ pub async fn start_session(cfg: SessionConfig) -> Result<Session, SessionError> 
 
   // ── session + services ──
   let admin_token = SessionToken::generate()?;
-  let pairing_code = cfg.auto_accept.then(PairingCode::generate).transpose()?;
+  // Open access needs no credential at all, so it never mints a pairing
+  // code even if `auto_accept` was also requested.
+  let pairing_code = (cfg.auto_accept && !cfg.open_access)
+    .then(PairingCode::generate)
+    .transpose()?;
   let (authorizer, approvals) = Authorizer::channel(16);
   let registry = Arc::new(PeerRegistry::new());
   let (kf_tx, kf_rx) = mpsc::channel(64);
@@ -264,11 +278,22 @@ pub async fn start_session(cfg: SessionConfig) -> Result<Session, SessionError> 
   let viewer_url = mdns::viewer_url(mdns.is_some(), iface.ip, cfg.port);
   let stream = build_stream_info(&cfg, dims, setup.backend, pipe.audio.is_some(), &viewer_url);
 
+  // Hardened open-access mode binds the HTTP/signaling listener to the one
+  // resolved interface so anonymous viewers can never reach it through an
+  // unintended network. Every other mode keeps the upstream wildcard bind.
+  let http_bind = if cfg.open_access {
+    iface.ip
+  } else {
+    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+  };
+
   let server = match spawn_server(ServerConfig {
     port: cfg.port,
+    http_bind,
     admin_token: admin_token.clone(),
     admin_allow_lan: cfg.allow_lan_admin,
     auto_accept_pairing: pairing_code.clone(),
+    open_access: cfg.open_access,
     authorizer,
     approvals: approvals.clone(),
     registry: Arc::clone(&registry),
@@ -296,13 +321,21 @@ pub async fn start_session(cfg: SessionConfig) -> Result<Session, SessionError> 
 
   let iface_ip = iface.ip;
   let port = server.addr.port();
+  // When open access binds the listener to the LAN interface, the loopback
+  // admin URL is unreachable, so advertise the interface-based admin URL
+  // instead (it still requires the secret token and `--allow-lan-admin`).
+  let admin_host = if cfg.open_access {
+    iface_ip
+  } else {
+    IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+  };
   let info = SessionInfo {
     iface,
     port,
     dims,
     fallback_url: mdns.is_some().then(|| mdns::fallback_url(iface_ip, port)),
     mdns_ok: mdns.is_some(),
-    admin_url: format!("http://127.0.0.1:{port}/admin/{admin_token}"),
+    admin_url: format!("http://{admin_host}:{port}/admin/{admin_token}"),
     lan_admin_url: cfg
       .allow_lan_admin
       .then(|| format!("http://{iface_ip}:{port}/admin/{admin_token}")),
